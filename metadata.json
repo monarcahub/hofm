@@ -1,0 +1,6 @@
+{
+  "name": "Hospital de Olhos Freitag Munareto",
+  "description": "Nova versão do site institucional do Hospital de Olhos Freitag Munareto em Timbó e Pomerode - SC. Tradição de 47 anos, tecnologia e atendimento humanizado.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
