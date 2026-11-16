@@ -63,10 +63,7 @@ export const IMAGES = {
       'facilities/consultation-room.jpg',
       '/src/assets/images/clinic_ophthalmology_modern_1793224637232.jpg'
     ),
-    macroEye: getStorageImageUrl(
-      'institutional/macro-iris.jpg',
-      '/src/assets/images/macro_human_eye_iris_1793224636927.jpg'
-    ),
+    macroEye: 'https://qqzvmwbweuaybkymkldi.supabase.co/storage/v1/object/public/clientes/HOFM/macro_human_eye_iris_FreitagMunareto.jpg',
     altFacilities: 'Consultório oftalmológico moderno equipado com tecnologia de ponta',
     altMacroEye: 'Close-up macro da íris e estrutura ocular saudável',
   },
