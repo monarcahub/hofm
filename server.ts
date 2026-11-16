@@ -1611,8 +1611,9 @@ app.post('/api/auth/request-patient-code', async (req: Request, res: Response) =
 // VITE DEV MIDDLEWARE / STATIC FILE SERVING
 // -------------------------------------------------------------
 async function setupViteOrStatic() {
-  if (!isProduction) {
-    const { createServer: createViteServer } = await import('vite');
+  if (!isProduction && process.env.VERCEL !== '1') {
+    const vitePkg = 'vite';
+    const { createServer: createViteServer } = await import(/* @vite-ignore */ vitePkg);
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
