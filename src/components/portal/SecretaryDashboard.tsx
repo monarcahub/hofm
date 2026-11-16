@@ -1215,7 +1215,7 @@ export const SecretaryDashboard: React.FC<SecretaryDashboardProps> = ({
               <span className="text-xs font-bold uppercase text-[#be7b52]">SEGURANÇA DA CONTA</span>
               <h3 className="text-lg font-bold text-[#004d5a]">Recuperação de Acesso</h3>
               <p className="text-xs text-slate-500">
-                Dispare um link de redefinição de credenciais de forma segura. O sistema não revela publicamente se o e-mail está cadastrado.
+                Envie o Código Identificador para o e-mail de um paciente ou dispare a recuperação de senha para membros da equipe de forma segura.
               </p>
             </div>
 

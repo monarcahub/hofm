@@ -1471,11 +1471,93 @@ app.get(
   }
 );
 
-// 14. Password recovery request: uses Supabase Auth reset password without revealing presence
+async function dispatchPatientRecoveryWebhook(
+  cleanEmail: string,
+  reqIp: string,
+  source: 'patient_portal' | 'secretary_panel'
+): Promise<{ matchedPatient: boolean; webhookTriggered: boolean; webhookStatus: string }> {
+  if (!supabaseAdmin) {
+    return { matchedPatient: false, webhookTriggered: false, webhookStatus: 'supabase_indisponivel' };
+  }
+
+  const { data: candidates } = await supabaseAdmin
+    .from('fm_patients')
+    .select('id, internal_id, full_name, email, phone')
+    .ilike('email', cleanEmail.replace(/[%_]/g, ''))
+    .limit(10);
+
+  const matchedPatient = (candidates || []).find(
+    (p: any) => p.email && p.email.trim().toLowerCase() === cleanEmail
+  );
+
+  let webhookTriggered = false;
+  let webhookStatus = 'nao_encontrado';
+
+  if (matchedPatient) {
+    try {
+      const webhookResponse = await fetch(PATIENT_RECOVERY_WEBHOOK_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          event: 'patient_code_recovery',
+          source,
+          patientFound: true,
+          patientId: matchedPatient.id,
+          fullName: matchedPatient.full_name,
+          email: matchedPatient.email,
+          phone: matchedPatient.phone,
+          internalId: matchedPatient.internal_id,
+          portalUrl: `${process.env.APP_URL || 'https://freitagmunareto.com.br'}/portal/login`,
+          requestedAt: new Date().toISOString(),
+        }),
+      });
+
+      webhookTriggered = webhookResponse.ok;
+      webhookStatus = webhookResponse.ok
+        ? 'webhook_enviado'
+        : `webhook_erro_${webhookResponse.status}`;
+    } catch (webhookErr: any) {
+      console.error('Erro ao acionar webhook de recuperação de código do paciente:', webhookErr);
+      webhookStatus = 'webhook_falha_rede';
+    }
+
+    await supabaseAdmin.from('fm_password_resets').insert({
+      email: cleanEmail,
+      requested_at: new Date().toISOString(),
+      status: webhookStatus,
+    });
+
+    await supabaseAdmin.from('fm_audit_logs').insert({
+      action: 'PATIENT_CODE_RECOVERY_REQUESTED',
+      entity_type: 'fm_patients',
+      entity_id: matchedPatient.id,
+      details: {
+        source,
+        patient_found: true,
+        webhook_triggered: webhookTriggered,
+        status: webhookStatus,
+      },
+      ip_address: reqIp,
+      created_at: new Date().toISOString(),
+    });
+  }
+
+  return {
+    matchedPatient: Boolean(matchedPatient),
+    webhookTriggered,
+    webhookStatus,
+  };
+}
+
+// 14. Password & Access recovery request: triggers patient webhook if email is a patient, otherwise Supabase Auth reset
 app.post('/api/auth/request-password-reset', async (req: Request, res: Response) => {
+  const genericMessage =
+    'Se este e-mail estiver cadastrado em nosso sistema, as instruções de recuperação foram enviadas.';
   try {
     const { email } = req.body;
-    if (!email || !email.includes('@')) {
+    if (!email || typeof email !== 'string' || !email.includes('@')) {
       res.status(400).json({ error: 'Informe um endereço de e-mail válido.' });
       return;
     }
@@ -1483,29 +1565,35 @@ app.post('/api/auth/request-password-reset', async (req: Request, res: Response)
     const cleanEmail = email.trim().toLowerCase();
 
     if (supabaseAdmin) {
-      // Record reset attempt in fm_password_resets for audit
-      await supabaseAdmin.from('fm_password_resets').insert({
-        email: cleanEmail,
-        requested_at: new Date().toISOString(),
-        status: 'solicitado',
-      });
+      const recoveryResult = await dispatchPatientRecoveryWebhook(
+        cleanEmail,
+        req.ip || '',
+        'secretary_panel'
+      );
 
-      // Trigger password recovery email from Supabase Auth
-      await supabaseAdmin.auth.resetPasswordForEmail(cleanEmail, {
-        redirectTo: `${process.env.APP_URL || 'https://freitagmunareto.com.br'}/portal/redefinir-senha`,
-      });
+      // If not found in fm_patients (e.g., staff/doctor account), use standard password reset
+      if (!recoveryResult.matchedPatient) {
+        await supabaseAdmin.from('fm_password_resets').insert({
+          email: cleanEmail,
+          requested_at: new Date().toISOString(),
+          status: 'solicitado',
+        });
+
+        await supabaseAdmin.auth.resetPasswordForEmail(cleanEmail, {
+          redirectTo: `${process.env.APP_URL || 'https://freitagmunareto.com.br'}/portal/redefinir-senha`,
+        });
+      }
     }
 
     // Always respond with identical non-revealing success message to prevent user enumeration
     res.json({
       success: true,
-      message: 'Se este e-mail estiver cadastrado em nosso sistema, as instruções de recuperação foram enviadas.',
+      message: genericMessage,
     });
   } catch (err: any) {
-    // Non-revealing response
     res.json({
       success: true,
-      message: 'Se este e-mail estiver cadastrado em nosso sistema, as instruções de recuperação foram enviadas.',
+      message: genericMessage,
     });
   }
 });
@@ -1529,70 +1617,33 @@ app.post('/api/auth/request-patient-code', async (req: Request, res: Response) =
       return;
     }
 
-    // Lookup patient by exact case-insensitive email match
-    const { data: candidates } = await supabaseAdmin
-      .from('fm_patients')
-      .select('id, internal_id, full_name, email, phone')
-      .ilike('email', cleanEmail.replace(/[%_]/g, ''))
-      .limit(10);
-
-    const matchedPatient = (candidates || []).find(
-      (p: any) => p.email && p.email.trim().toLowerCase() === cleanEmail
+    const result = await dispatchPatientRecoveryWebhook(
+      cleanEmail,
+      req.ip || '',
+      'patient_portal'
     );
 
-    let webhookTriggered = false;
-    let webhookStatus = 'nao_encontrado';
+    if (!result.matchedPatient) {
+      await supabaseAdmin.from('fm_password_resets').insert({
+        email: cleanEmail,
+        requested_at: new Date().toISOString(),
+        status: 'nao_encontrado',
+      });
 
-    if (matchedPatient) {
-      try {
-        const webhookResponse = await fetch(PATIENT_RECOVERY_WEBHOOK_URL, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            ...(N8N_WEBHOOK_TOKEN ? { 'X-Webhook-Token': N8N_WEBHOOK_TOKEN } : {}),
-          },
-          body: JSON.stringify({
-            event: 'patient_code_recovery',
-            patientFound: true,
-            patientId: matchedPatient.id,
-            fullName: matchedPatient.full_name,
-            email: matchedPatient.email,
-            phone: matchedPatient.phone,
-            internalId: matchedPatient.internal_id,
-            portalUrl: `${process.env.APP_URL || 'https://freitagmunareto.com.br'}/portal/login`,
-            requestedAt: new Date().toISOString(),
-          }),
-        });
-
-        webhookTriggered = webhookResponse.ok;
-        webhookStatus = webhookResponse.ok
-          ? 'webhook_enviado'
-          : `webhook_erro_${webhookResponse.status}`;
-      } catch (webhookErr: any) {
-        console.error('Erro ao acionar webhook de recuperação de código do paciente:', webhookErr);
-        webhookStatus = 'webhook_falha_rede';
-      }
+      await supabaseAdmin.from('fm_audit_logs').insert({
+        action: 'PATIENT_CODE_RECOVERY_REQUESTED',
+        entity_type: 'fm_patients',
+        entity_id: '',
+        details: {
+          source: 'patient_portal',
+          patient_found: false,
+          webhook_triggered: false,
+          status: 'nao_encontrado',
+        },
+        ip_address: req.ip || '',
+        created_at: new Date().toISOString(),
+      });
     }
-
-    // Record attempt for security audit
-    await supabaseAdmin.from('fm_password_resets').insert({
-      email: cleanEmail,
-      requested_at: new Date().toISOString(),
-      status: webhookStatus,
-    });
-
-    await supabaseAdmin.from('fm_audit_logs').insert({
-      action: 'PATIENT_CODE_RECOVERY_REQUESTED',
-      entity_type: 'fm_patients',
-      entity_id: matchedPatient?.id || '',
-      details: {
-        patient_found: Boolean(matchedPatient),
-        webhook_triggered: webhookTriggered,
-        status: webhookStatus,
-      },
-      ip_address: req.ip || '',
-      created_at: new Date().toISOString(),
-    });
 
     // Always respond with non-revealing success message to preserve patient privacy
     res.json({
