@@ -28,7 +28,8 @@ const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
 const N8N_WEBHOOK_URL = process.env.N8N_WEBHOOK_URL || '';
 const N8N_WEBHOOK_TOKEN = process.env.N8N_WEBHOOK_TOKEN || '';
 const PATIENT_RECOVERY_WEBHOOK_URL =
-  process.env.PATIENT_RECOVERY_WEBHOOK_URL || 'https://webhook.monarcahub.com/webhook/recupera-acesso';
+  (process.env.PATIENT_RECOVERY_WEBHOOK_URL || '').replace(/^["']|["']$/g, '').trim() ||
+  'https://webhook.monarcahub.com/webhook/recupera-acesso';
 
 // Initialize Admin Supabase Client (Exclusively server-side with service_role key)
 const supabaseAdmin = (SUPABASE_URL && SUPABASE_SERVICE_ROLE_KEY)
@@ -230,6 +231,7 @@ app.get('/api/health', (_req: Request, res: Response) => {
     hasAnonKey: !!SUPABASE_ANON_KEY,
     hasServiceRoleKey: !!SUPABASE_SERVICE_ROLE_KEY,
     hasN8nWebhook: !!N8N_WEBHOOK_URL,
+    hasPatientRecoveryWebhook: !!PATIENT_RECOVERY_WEBHOOK_URL,
   });
 });
 
@@ -1480,11 +1482,15 @@ async function dispatchPatientRecoveryWebhook(
     return { matchedPatient: false, webhookTriggered: false, webhookStatus: 'supabase_indisponivel' };
   }
 
-  const { data: candidates } = await supabaseAdmin
+  const { data: candidates, error: lookupError } = await supabaseAdmin
     .from('fm_patients')
     .select('id, internal_id, full_name, email, phone')
-    .ilike('email', cleanEmail.replace(/[%_]/g, ''))
-    .limit(10);
+    .ilike('email', `%${cleanEmail.replace(/[%_]/g, '')}%`)
+    .limit(20);
+
+  if (lookupError) {
+    console.error('Erro ao buscar paciente em fm_patients para recuperação:', lookupError.message);
+  }
 
   const matchedPatient = (candidates || []).find(
     (p: any) => p.email && p.email.trim().toLowerCase() === cleanEmail
@@ -1515,6 +1521,13 @@ async function dispatchPatientRecoveryWebhook(
       });
 
       webhookTriggered = webhookResponse.ok;
+      if (!webhookResponse.ok) {
+        const errBody = await webhookResponse.text().catch(() => '');
+        console.error(
+          `Webhook de recuperação retornou HTTP ${webhookResponse.status}:`,
+          errBody.slice(0, 300)
+        );
+      }
       webhookStatus = webhookResponse.ok
         ? 'webhook_enviado'
         : `webhook_erro_${webhookResponse.status}`;
@@ -1579,9 +1592,12 @@ app.post('/api/auth/request-password-reset', async (req: Request, res: Response)
           status: 'solicitado',
         });
 
-        await supabaseAdmin.auth.resetPasswordForEmail(cleanEmail, {
+        const { error: resetErr } = await supabaseAdmin.auth.resetPasswordForEmail(cleanEmail, {
           redirectTo: `${process.env.APP_URL || 'https://freitagmunareto.com.br'}/portal/redefinir-senha`,
         });
+        if (resetErr) {
+          console.error('Erro ao enviar redefinição de senha via Supabase Auth:', resetErr.message);
+        }
       }
     }
 
