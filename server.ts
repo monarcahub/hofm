@@ -1088,6 +1088,103 @@ app.get(
   }
 );
 
+function normalizeNotificationStatusForUi(
+  rawStatus?: string | null
+): 'pendente' | 'processando' | 'enviado' | 'entregue' | 'lido' | 'falha' {
+  const s = (rawStatus || '').toString().trim().toLowerCase();
+  if (s === 'entregue' || s === 'delivered') return 'entregue';
+  if (s === 'lido' || s === 'read' || s === 'visualizado') return 'lido';
+  if (s === 'enviado' || s === 'enviada' || s === 'sent' || s === 'accepted' || s === 'aceito') return 'enviado';
+  if (s === 'falha' || s === 'falhou' || s === 'failed' || s === 'error' || s === 'rejeitado') return 'falha';
+  if (s === 'processando' || s === 'processing' || s === 'queued') return 'processando';
+  return 'pendente';
+}
+
+function getNotificationStatusCandidates(
+  desiredStatus: 'pendente' | 'processando' | 'enviado' | 'entregue' | 'lido' | 'falha'
+): string[] {
+  switch (desiredStatus) {
+    case 'pendente':
+      return ['pendente', 'pending', 'aguardando', 'solicitado', 'aberto', 'novo', 'processando', 'processing', 'enviado', 'enviada', 'sent'];
+    case 'processando':
+      return ['processando', 'processing', 'queued', 'pendente', 'pending', 'aguardando', 'solicitado', 'aberto', 'novo', 'enviado', 'enviada', 'sent'];
+    case 'enviado':
+      return ['enviado', 'enviada', 'sent', 'accepted'];
+    case 'entregue':
+      return ['entregue', 'delivered', 'enviado', 'enviada', 'sent'];
+    case 'lido':
+      return ['lido', 'read', 'entregue', 'delivered'];
+    case 'falha':
+      return ['falha', 'falhou', 'failed', 'error', 'enviado', 'sent'];
+  }
+}
+
+async function insertNotificationSafe(
+  payload: Record<string, any>,
+  desiredStatus: 'pendente' | 'processando' | 'enviado' | 'entregue' | 'lido' | 'falha'
+) {
+  if (!supabaseAdmin) {
+    return { data: null, error: { message: 'Supabase admin não configurado.' } };
+  }
+
+  const candidates = getNotificationStatusCandidates(desiredStatus);
+  let lastResult: { data: any; error: any } = { data: null, error: null };
+
+  for (const candidateStatus of candidates) {
+    const res = await supabaseAdmin
+      .from('fm_notifications')
+      .insert({ ...payload, status: candidateStatus })
+      .select()
+      .single();
+
+    if (!res.error && res.data) {
+      return res;
+    }
+
+    lastResult = res;
+    const errMsg = res.error?.message || '';
+    if (!/fm_notifications_status_check|check constraint|violates check/i.test(errMsg)) {
+      break;
+    }
+  }
+
+  return lastResult;
+}
+
+async function updateNotificationSafe(
+  id: string,
+  payload: Record<string, any>,
+  desiredStatus: 'pendente' | 'processando' | 'enviado' | 'entregue' | 'lido' | 'falha'
+) {
+  if (!supabaseAdmin) {
+    return { data: null, error: { message: 'Supabase admin não configurado.' } };
+  }
+
+  const candidates = getNotificationStatusCandidates(desiredStatus);
+  let lastResult: { data: any; error: any } = { data: null, error: null };
+
+  for (const candidateStatus of candidates) {
+    const res = await supabaseAdmin
+      .from('fm_notifications')
+      .update({ ...payload, status: candidateStatus })
+      .eq('id', id)
+      .select()
+      .maybeSingle();
+
+    if (!res.error) {
+      return res;
+    }
+
+    lastResult = res;
+    const errMsg = res.error?.message || '';
+    if (!/fm_notifications_status_check|check constraint|violates check/i.test(errMsg)) {
+      break;
+    }
+  }
+
+  return lastResult;
+}
+
 // 10. WhatsApp Option A: Log WhatsApp Web click (Without falsely claiming message was sent)
 app.post(
   '/api/notifications/log-whatsapp-click',
@@ -1095,22 +1192,75 @@ app.post(
   requireRoles(['admin', 'secretary']),
   async (req: AuthenticatedRequest, res: Response) => {
     try {
-      const { patientId, examId } = req.body;
+      const { patientId, examId, examIds } = req.body;
+      const targetExamIds: string[] = Array.isArray(examIds)
+        ? examIds.filter((id: unknown): id is string => typeof id === 'string' && id.trim().length > 0)
+        : examId && typeof examId === 'string'
+        ? [examId]
+        : [];
+      const primaryExamId = targetExamIds[0] || examId || null;
 
-      if (supabaseAdmin) {
-        await supabaseAdmin.from('fm_notifications').insert({
+      if (!patientId || typeof patientId !== 'string') {
+        res.status(400).json({ success: false, error: 'Identificador do paciente é obrigatório.' });
+        return;
+      }
+
+      if (!supabaseAdmin) {
+        res.status(503).json({ success: false, error: 'Configuração do servidor indisponível.' });
+        return;
+      }
+
+      const nowIso = new Date().toISOString();
+      const { data: inserted, error: insertErr } = await insertNotificationSafe(
+        {
           patient_id: patientId,
-          exam_id: examId,
+          exam_id: primaryExamId,
           channel: 'whatsapp_web',
           template_name: 'manual_web_click',
-          status: 'processando', // recorded as opened, not falsely claimed as delivered
-          created_at: new Date().toISOString(),
+          created_at: nowIso,
+        },
+        'processando'
+      );
+
+      if (insertErr || !inserted) {
+        console.error('Erro ao registrar clique de WhatsApp Web em fm_notifications:', insertErr?.message);
+        res.status(400).json({
+          success: false,
+          error: `Não foi possível registrar no histórico: ${insertErr?.message || 'erro desconhecido'}`,
+        });
+        return;
+      }
+
+      if (targetExamIds.length > 1) {
+        const { data: batchExams } = await supabaseAdmin
+          .from('fm_exams')
+          .select('id, title')
+          .in('id', targetExamIds);
+
+        const titles = (batchExams || []).map((e: any) => e.title).filter(Boolean);
+        const summary =
+          titles.length > 1
+            ? `${titles[0]} (+${titles.length - 1} ${titles.length - 1 === 1 ? 'exame' : 'exames'})`
+            : titles[0] || `${targetExamIds.length} exames`;
+
+        await supabaseAdmin.from('fm_audit_logs').insert({
+          user_id: req.user!.id,
+          action: 'NOTIFICATION_BATCH_LOGGED',
+          entity_type: 'fm_notifications',
+          entity_id: inserted.id,
+          details: {
+            exam_ids: targetExamIds,
+            exam_titles: titles,
+            summary,
+          },
+          ip_address: req.ip || '',
+          created_at: nowIso,
         });
       }
 
-      res.json({ success: true, logged: true });
+      res.json({ success: true, logged: true, notification: inserted });
     } catch (err: any) {
-      res.status(500).json({ error: 'Erro ao registrar clique.' });
+      res.status(500).json({ success: false, error: 'Erro ao registrar clique.' });
     }
   }
 );
@@ -1122,7 +1272,13 @@ app.post(
   requireRoles(['admin', 'secretary']),
   async (req: AuthenticatedRequest, res: Response) => {
     try {
-      const { patientId, examId, templateName } = req.body;
+      const { patientId, examId, examIds, templateName } = req.body;
+      const targetExamIds: string[] = Array.isArray(examIds)
+        ? examIds.filter((id: unknown): id is string => typeof id === 'string' && id.trim().length > 0)
+        : examId && typeof examId === 'string'
+        ? [examId]
+        : [];
+      const primaryExamId = targetExamIds[0] || examId || null;
 
       // If webhook is not configured, present resource as unavailable to administrative team
       if (!N8N_WEBHOOK_URL) {
@@ -1146,34 +1302,58 @@ app.post(
         .eq('id', patientId)
         .single();
 
-      const { data: exam } = await supabaseAdmin
-        .from('fm_exams')
-        .select('id, title, exam_date')
-        .eq('id', examId)
-        .single();
+      const { data: matchedExams } = primaryExamId
+        ? await supabaseAdmin
+            .from('fm_exams')
+            .select('id, title, exam_date')
+            .in('id', targetExamIds.length > 0 ? targetExamIds : [primaryExamId])
+        : { data: [] };
+
+      const exam = (matchedExams || [])[0] || null;
 
       if (!patient || !exam) {
         res.status(404).json({ error: 'Dados do paciente ou exame não localizados.' });
         return;
       }
 
+      const examTitles = (matchedExams || []).map((e: any) => e.title).filter(Boolean);
+      const examTitleSummary =
+        examTitles.length > 1
+          ? `${examTitles[0]} (+${examTitles.length - 1} ${examTitles.length - 1 === 1 ? 'exame' : 'exames'})`
+          : exam.title;
+
       // 1. Initial State: 'pendente' (Solicitação registrada no banco HOFM)
-      const { data: notifRecord, error: notifErr } = await supabaseAdmin
-        .from('fm_notifications')
-        .insert({
+      const { data: notifRecord, error: notifErr } = await insertNotificationSafe(
+        {
           patient_id: patientId,
-          exam_id: examId,
+          exam_id: exam.id,
           channel: 'whatsapp_meta_template',
           template_name: templateName || 'exame_disponivel_hof',
-          status: 'pendente',
           created_at: new Date().toISOString(),
-        })
-        .select()
-        .single();
+        },
+        'pendente'
+      );
 
       if (notifErr || !notifRecord) {
-        res.status(500).json({ error: 'Erro ao registrar notificação inicial.' });
+        console.error('Erro ao inserir notificação inicial em fm_notifications:', notifErr?.message);
+        res.status(500).json({ error: `Erro ao registrar notificação inicial: ${notifErr?.message || ''}` });
         return;
+      }
+
+      if (targetExamIds.length > 1) {
+        await supabaseAdmin.from('fm_audit_logs').insert({
+          user_id: req.user!.id,
+          action: 'NOTIFICATION_BATCH_LOGGED',
+          entity_type: 'fm_notifications',
+          entity_id: notifRecord.id,
+          details: {
+            exam_ids: targetExamIds,
+            exam_titles: examTitles,
+            summary: examTitleSummary,
+          },
+          ip_address: req.ip || '',
+          created_at: new Date().toISOString(),
+        });
       }
 
       // 2. Dispatch to secure n8n webhook with X-Webhook-Token header
@@ -1188,23 +1368,24 @@ app.post(
             notificationId: notifRecord.id,
             patientId: patient.id,
             examId: exam.id,
+            examIds: targetExamIds.length > 0 ? targetExamIds : [exam.id],
             templateName: templateName || 'exame_disponivel_hof',
             recipientPhone: patient.phone,
             recipientName: patient.full_name,
-            examTitle: exam.title,
+            examTitle: examTitleSummary,
             callbackUrl: `${process.env.APP_URL || ''}/api/notifications/status-callback`,
           }),
         });
 
         if (!response.ok) {
           const errText = await response.text();
-          await supabaseAdmin
-            .from('fm_notifications')
-            .update({
-              status: 'falha',
+          await updateNotificationSafe(
+            notifRecord.id,
+            {
               error_message: `Webhook retornou HTTP ${response.status}: ${errText.slice(0, 250)}`,
-            })
-            .eq('id', notifRecord.id);
+            },
+            'falha'
+          );
 
           res.status(502).json({
             success: false,
@@ -1251,23 +1432,18 @@ app.post(
           statusMessage = 'Solicitação recebida pelo n8n; aguardando confirmação de aceite da Meta.';
         }
 
-        const updatePayload: any = {
-          status: resolvedStatus,
-        };
+        const updatePayload: any = {};
 
         if (resolvedStatus === 'enviado') {
           updatePayload.sent_at = new Date().toISOString();
         } else if (resolvedStatus === 'entregue') {
-          updatePayload.sent_at = updatePayload.sent_at || new Date().toISOString();
+          updatePayload.sent_at = new Date().toISOString();
           updatePayload.delivered_at = new Date().toISOString();
         } else if (resolvedStatus === 'falha') {
           updatePayload.error_message = statusMessage;
         }
 
-        await supabaseAdmin
-          .from('fm_notifications')
-          .update(updatePayload)
-          .eq('id', notifRecord.id);
+        await updateNotificationSafe(notifRecord.id, updatePayload, resolvedStatus);
 
         res.json({
           success: resolvedStatus !== 'falha',
@@ -1277,13 +1453,13 @@ app.post(
           message: statusMessage,
         });
       } catch (webhookErr: any) {
-        await supabaseAdmin
-          .from('fm_notifications')
-          .update({
-            status: 'falha',
+        await updateNotificationSafe(
+          notifRecord.id,
+          {
             error_message: `Falha na conexão com n8n: ${webhookErr.message}`,
-          })
-          .eq('id', notifRecord.id);
+          },
+          'falha'
+        );
 
         res.status(502).json({
           success: false,
@@ -1357,9 +1533,7 @@ const handleStatusCallback = async (req: Request, res: Response) => {
       normalizedStatus = 'pendente';
     }
 
-    const updateFields: any = {
-      status: normalizedStatus,
-    };
+    const updateFields: any = {};
 
     if (normalizedStatus === 'enviado') {
       updateFields.sent_at = new Date().toISOString();
@@ -1369,12 +1543,13 @@ const handleStatusCallback = async (req: Request, res: Response) => {
       updateFields.error_message = (errorMessage || error || 'Falha de entrega reportada pela Meta').toString();
     }
 
-    let query = supabaseAdmin.from('fm_notifications').update(updateFields);
+    let updated: any = null;
+    let updateErr: any = null;
     if (targetId) {
-      query = query.eq('id', targetId);
+      const updRes = await updateNotificationSafe(targetId, updateFields, normalizedStatus);
+      updated = updRes.data;
+      updateErr = updRes.error;
     }
-
-    const { data: updated, error: updateErr } = await query.select().maybeSingle();
 
     if (updateErr) {
       res.status(500).json({ error: `Erro ao atualizar notificação: ${updateErr.message}` });
@@ -1409,7 +1584,7 @@ const handleStatusCallback = async (req: Request, res: Response) => {
 app.post('/api/notifications/status-callback', handleStatusCallback);
 app.post('/api/notifications/callback', handleStatusCallback);
 
-// 13. List notification history
+// 13. List notification history (resilient without requiring PostgREST embedded FK constraints)
 app.get(
   '/api/admin/notifications',
   requireAuth,
@@ -1421,50 +1596,107 @@ app.get(
         return;
       }
 
-      const { data: notifications, error } = await supabaseAdmin
+      const { data: rawNotifications, error } = await supabaseAdmin
         .from('fm_notifications')
-        .select('*, patient:fm_patients(id, full_name, phone), exam:fm_exams(id, title)')
+        .select('*')
         .order('created_at', { ascending: false })
         .limit(50);
 
       if (error) {
+        console.error('Erro ao listar fm_notifications:', error.message);
         res.status(400).json({ error: error.message });
         return;
       }
 
-      const normalizedNotifications = (notifications || []).map((n: any) => ({
-        ...n,
-        id: n.id,
-        patientId: n.patient_id || n.patientId,
-        patient_id: n.patient_id || n.patientId,
-        examId: n.exam_id || n.examId,
-        exam_id: n.exam_id || n.examId,
-        channel: n.channel,
-        templateName: n.template_name || n.templateName,
-        template_name: n.template_name || n.templateName,
-        status: n.status,
-        wamid: n.wamid,
-        errorMessage: n.error_message || n.errorMessage,
-        error_message: n.error_message || n.errorMessage,
-        sentAt: n.sent_at || n.sentAt,
-        sent_at: n.sent_at || n.sentAt,
-        deliveredAt: n.delivered_at || n.deliveredAt,
-        delivered_at: n.delivered_at || n.deliveredAt,
-        createdAt: n.created_at || n.createdAt,
-        created_at: n.created_at || n.createdAt,
-        patient: n.patient ? {
-          ...n.patient,
-          id: n.patient.id,
-          fullName: n.patient.full_name || n.patient.fullName || '',
-          full_name: n.patient.full_name || n.patient.fullName || '',
-          phone: n.patient.phone || '',
-        } : undefined,
-        exam: n.exam ? {
-          ...n.exam,
-          id: n.exam.id,
-          title: n.exam.title,
-        } : undefined,
-      }));
+      const rows = rawNotifications || [];
+      const patientIds = Array.from(
+        new Set(rows.map((n: any) => n.patient_id || n.patientId).filter(Boolean))
+      );
+      const examIds = Array.from(
+        new Set(rows.map((n: any) => n.exam_id || n.examId).filter(Boolean))
+      );
+      const notifIds = rows.map((n: any) => n.id).filter(Boolean);
+
+      const [patientsRes, examsRes, batchLogsRes] = await Promise.all([
+        patientIds.length > 0
+          ? supabaseAdmin.from('fm_patients').select('id, full_name, phone').in('id', patientIds)
+          : Promise.resolve({ data: [] as any[] }),
+        examIds.length > 0
+          ? supabaseAdmin.from('fm_exams').select('id, title').in('id', examIds)
+          : Promise.resolve({ data: [] as any[] }),
+        notifIds.length > 0
+          ? supabaseAdmin
+              .from('fm_audit_logs')
+              .select('entity_id, details')
+              .eq('action', 'NOTIFICATION_BATCH_LOGGED')
+              .in('entity_id', notifIds)
+          : Promise.resolve({ data: [] as any[] }),
+      ]);
+
+      const patientMap = new Map<string, any>();
+      for (const p of patientsRes.data || []) {
+        patientMap.set(p.id, p);
+      }
+
+      const examMap = new Map<string, any>();
+      for (const e of examsRes.data || []) {
+        examMap.set(e.id, e);
+      }
+
+      const batchSummaryMap = new Map<string, string>();
+      for (const log of batchLogsRes.data || []) {
+        const summary = log?.details?.summary;
+        if (log?.entity_id && typeof summary === 'string' && summary.trim()) {
+          batchSummaryMap.set(log.entity_id, summary);
+        }
+      }
+
+      const normalizedNotifications = rows.map((n: any) => {
+        const pid = n.patient_id || n.patientId;
+        const eid = n.exam_id || n.examId;
+        const patientObj = pid ? patientMap.get(pid) : undefined;
+        const examObj = eid ? examMap.get(eid) : undefined;
+        const batchSummary = batchSummaryMap.get(n.id);
+
+        return {
+          ...n,
+          id: n.id,
+          patientId: pid,
+          patient_id: pid,
+          examId: eid,
+          exam_id: eid,
+          examSummary: batchSummary || examObj?.title || undefined,
+          channel: n.channel,
+          templateName: n.template_name || n.templateName,
+          template_name: n.template_name || n.templateName,
+          status: normalizeNotificationStatusForUi(n.status),
+          wamid: n.wamid,
+          errorMessage: n.error_message || n.errorMessage,
+          error_message: n.error_message || n.errorMessage,
+          sentAt: n.sent_at || n.sentAt,
+          sent_at: n.sent_at || n.sentAt,
+          deliveredAt: n.delivered_at || n.deliveredAt,
+          delivered_at: n.delivered_at || n.deliveredAt,
+          createdAt: n.created_at || n.createdAt,
+          created_at: n.created_at || n.createdAt,
+          patient: patientObj
+            ? {
+                ...patientObj,
+                id: patientObj.id,
+                fullName: patientObj.full_name || patientObj.fullName || '',
+                full_name: patientObj.full_name || patientObj.fullName || '',
+                phone: patientObj.phone || '',
+              }
+            : undefined,
+          exam: examObj
+            ? {
+                ...examObj,
+                id: examObj.id,
+                title: examObj.title,
+              }
+            : undefined,
+        };
+      });
 
       res.json({ notifications: normalizedNotifications });
     } catch (err: any) {

@@ -84,7 +84,8 @@ export interface NotificationRecord {
   id: string;
   patientId: string;
   examId?: string;
-  channel: 'whatsapp_web' | 'whatsapp_meta_template';
+  examSummary?: string;
+  channel: 'whatsapp_web' | 'whatsapp_meta_template' | 'email';
   templateName?: string;
   status: NotificationStatus;
   wamid?: string;

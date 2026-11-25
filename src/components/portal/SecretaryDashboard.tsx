@@ -70,7 +70,9 @@ export const SecretaryDashboard: React.FC<SecretaryDashboardProps> = ({
 
   // Publish / Notify Modal
   const [publishingExam, setPublishingExam] = useState<Exam | null>(null);
-  const [publishStatus, setPublishStatus] = useState<string | null>(null);
+  const [selectedNotifyExamIds, setSelectedNotifyExamIds] = useState<string[]>([]);
+  const [publishStatus, setPublishStatus] = useState<{ type: 'info' | 'success' | 'error'; message: string } | null>(null);
+  const [notificationsError, setNotificationsError] = useState<string | null>(null);
 
   // Recovery Modal
   const [showResetModal, setShowResetModal] = useState(false);
@@ -119,6 +121,10 @@ export const SecretaryDashboard: React.FC<SecretaryDashboardProps> = ({
       if (nRes.ok) {
         const nData = await nRes.json();
         setNotifications(nData.notifications || []);
+        setNotificationsError(null);
+      } else {
+        const nErr = await nRes.json().catch(() => ({}));
+        setNotificationsError(nErr.error || 'Não foi possível carregar o histórico de notificações.');
       }
     } catch (err) {
       console.warn('Carregamento inicial via API local:', err);
@@ -446,6 +452,12 @@ export const SecretaryDashboard: React.FC<SecretaryDashboardProps> = ({
     }
   };
 
+  const openNotifyModal = (exam: Exam) => {
+    setPublishingExam(exam);
+    setSelectedNotifyExamIds([exam.id]);
+    setPublishStatus(null);
+  };
+
   // Handle Exam Publish
   const handlePublishExam = async (exam: Exam) => {
     const token = session?.access_token || '';
@@ -456,11 +468,22 @@ export const SecretaryDashboard: React.FC<SecretaryDashboardProps> = ({
       });
 
       if (res.ok) {
-        setPublishingExam(exam); // Open notification modal
+        openNotifyModal(exam); // Open notification modal
         loadData();
       }
     } catch (err) {
       console.error('Erro ao publicar exame:', err);
+    }
+  };
+
+  const ensureSelectedExamsPublished = async (examIds: string[]) => {
+    const token = session?.access_token || '';
+    const draftsToPublish = exams.filter((ex) => examIds.includes(ex.id) && !ex.isPublished);
+    for (const draft of draftsToPublish) {
+      await fetch(`/api/admin/exams/${draft.id}/publish`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      });
     }
   };
 
@@ -469,36 +492,67 @@ export const SecretaryDashboard: React.FC<SecretaryDashboardProps> = ({
     const patientName = exam.patient?.fullName || 'Paciente';
     const firstName = patientName.split(' ')[0];
     const phone = exam.patient?.phone?.replace(/\D/g, '') || '';
+    const targetIds = selectedNotifyExamIds.length > 0 ? selectedNotifyExamIds : [exam.id];
 
-    const text = `Olá, ${firstName}! O Hospital de Olhos Freitag Munareto informa que seu exame já está disponível no Portal do Paciente. Acesse https://freitagmunareto.com.br/portal/login para consultar.`;
+    const plural = targetIds.length > 1;
+    const text = `Olá, ${firstName}! O Hospital de Olhos Freitag Munareto informa que ${
+      plural ? 'seus exames já estão disponíveis' : 'seu exame já está disponível'
+    } no Portal do Paciente. Acesse https://freitagmunareto.com.br/portal/login para consultar.`;
     const url = `https://wa.me/${phone.startsWith('55') ? phone : `55${phone}`}?text=${encodeURIComponent(text)}`;
 
-    window.open(url, '_blank');
+    window.open(url, '_blank', 'noopener,noreferrer');
 
-    // Register that WhatsApp Web was clicked
-    const token = session?.access_token || '';
-    await fetch('/api/notifications/log-whatsapp-click', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${token}`,
-      },
-      body: JSON.stringify({
-        patientId: exam.patientId || exam.patient?.id,
-        examId: exam.id,
-      }),
-    });
+    setPublishStatus({ type: 'info', message: 'Registrando envio no histórico...' });
 
-    setPublishStatus('WhatsApp Web aberto para envio manual.');
-    loadData();
+    try {
+      await ensureSelectedExamsPublished(targetIds);
+
+      const token = session?.access_token || '';
+      const res = await fetch('/api/notifications/log-whatsapp-click', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          patientId: exam.patientId || exam.patient?.id,
+          examId: targetIds[0],
+          examIds: targetIds,
+        }),
+      });
+
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success) {
+        setPublishStatus({
+          type: 'success',
+          message: `WA Web aberto e registrado no histórico (${targetIds.length} ${
+            targetIds.length === 1 ? 'exame' : 'exames'
+          }).`,
+        });
+        await loadData();
+      } else {
+        setPublishStatus({
+          type: 'error',
+          message: data.error || 'O WhatsApp Web foi aberto, mas houve erro ao salvar no histórico.',
+        });
+      }
+    } catch (err: any) {
+      setPublishStatus({
+        type: 'error',
+        message: `Erro ao registrar no histórico: ${err.message || 'falha de conexão'}`,
+      });
+    }
   };
 
   // WhatsApp Option B: Automated Meta Template via server dispatch
   const handleWhatsAppMetaWebhook = async (exam: Exam) => {
-    setPublishStatus('Disparando notificação automática oficial...');
+    setPublishStatus({ type: 'info', message: 'Disparando notificação automática oficial (WA Oficial)...' });
     const token = session?.access_token || '';
+    const targetIds = selectedNotifyExamIds.length > 0 ? selectedNotifyExamIds : [exam.id];
 
     try {
+      await ensureSelectedExamsPublished(targetIds);
+
       const res = await fetch('/api/notifications/whatsapp-webhook', {
         method: 'POST',
         headers: {
@@ -507,20 +561,27 @@ export const SecretaryDashboard: React.FC<SecretaryDashboardProps> = ({
         },
         body: JSON.stringify({
           patientId: exam.patientId || exam.patient?.id,
-          examId: exam.id,
+          examId: targetIds[0],
+          examIds: targetIds,
           templateName: 'exame_disponivel_hof',
         }),
       });
 
-      const data = await res.json();
+      const data = await res.json().catch(() => ({}));
       if (res.ok && data.success) {
-        setPublishStatus('Notificação automática enviada com sucesso para o paciente!');
+        setPublishStatus({
+          type: 'success',
+          message: data.message || 'Notificação oficial disparada e registrada no histórico!',
+        });
       } else {
-        setPublishStatus(data.message || data.error || 'Serviço de envio automático indisponível no momento.');
+        setPublishStatus({
+          type: 'error',
+          message: data.message || data.error || 'Serviço de envio automático indisponível no momento.',
+        });
       }
-      loadData();
+      await loadData();
     } catch (err: any) {
-      setPublishStatus(`Falha no envio: ${err.message}`);
+      setPublishStatus({ type: 'error', message: `Falha no envio: ${err.message}` });
     }
   };
 
@@ -1126,7 +1187,7 @@ export const SecretaryDashboard: React.FC<SecretaryDashboardProps> = ({
                               </button>
                             ) : (
                               <button
-                                onClick={() => setPublishingExam(exam)}
+                                onClick={() => openNotifyModal(exam)}
                                 className="text-[#004d5a] hover:underline font-bold text-[11px]"
                               >
                                 Notificar
@@ -1142,9 +1203,14 @@ export const SecretaryDashboard: React.FC<SecretaryDashboardProps> = ({
             </div>
 
             {/* Notification / Publish Modal */}
-            {publishingExam && (
+            {publishingExam && (() => {
+              const targetPatientId = publishingExam.patientId || publishingExam.patient?.id;
+              const patientExamsList = exams.filter(
+                (ex) => (ex.patientId || ex.patient?.id) === targetPatientId
+              );
+              return (
               <div className="fixed inset-0 z-50 bg-black/50 backdrop-blur-xs flex items-center justify-center p-4">
-                <div className="bg-white rounded-3xl max-w-md w-full p-6 sm:p-8 shadow-2xl border border-slate-200 relative animate-in fade-in space-y-5">
+                <div className="bg-white rounded-3xl max-w-md w-full p-6 sm:p-8 shadow-2xl border border-slate-200 relative animate-in fade-in space-y-4 max-h-[90vh] overflow-y-auto">
                   <button
                     onClick={() => {
                       setPublishingExam(null);
@@ -1165,52 +1231,119 @@ export const SecretaryDashboard: React.FC<SecretaryDashboardProps> = ({
                     </p>
                   </div>
 
-                  {publishStatus && (
-                    <div className="p-3 bg-teal-50 border border-teal-200 rounded-xl text-xs text-[#004d5a] font-medium">
-                      {publishStatus}
+                  {patientExamsList.length > 1 && (
+                    <div className="p-3 rounded-2xl bg-slate-50 border border-slate-200/80 space-y-2">
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="text-[11px] font-bold text-[#004d5a]">
+                          Exames incluídos na notificação ({selectedNotifyExamIds.length}/{patientExamsList.length})
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() =>
+                            setSelectedNotifyExamIds(
+                              selectedNotifyExamIds.length === patientExamsList.length
+                                ? [publishingExam.id]
+                                : patientExamsList.map((ex) => ex.id)
+                            )
+                          }
+                          className="text-[11px] font-semibold text-[#be7b52] hover:underline cursor-pointer"
+                        >
+                          {selectedNotifyExamIds.length === patientExamsList.length
+                            ? 'Apenas este'
+                            : 'Selecionar todos'}
+                        </button>
+                      </div>
+                      <div className="space-y-1.5 max-h-32 overflow-y-auto pr-1">
+                        {patientExamsList.map((ex) => {
+                          const checked = selectedNotifyExamIds.includes(ex.id);
+                          return (
+                            <label
+                              key={ex.id}
+                              className="flex items-center gap-2 text-xs text-slate-700 cursor-pointer"
+                            >
+                              <input
+                                type="checkbox"
+                                checked={checked}
+                                onChange={(e) => {
+                                  if (e.target.checked) {
+                                    setSelectedNotifyExamIds((prev) =>
+                                      prev.includes(ex.id) ? prev : [...prev, ex.id]
+                                    );
+                                  } else if (selectedNotifyExamIds.length > 1) {
+                                    setSelectedNotifyExamIds((prev) =>
+                                      prev.filter((id) => id !== ex.id)
+                                    );
+                                  }
+                                }}
+                                className="h-3.5 w-3.5 rounded border-slate-300 text-[#004d5a]"
+                              />
+                              <span className="truncate flex-1">{ex.title}</span>
+                              {!ex.isPublished && (
+                                <span className="text-[10px] text-amber-700 bg-amber-50 px-1.5 py-0.5 rounded font-semibold">
+                                  Publicar junto
+                                </span>
+                              )}
+                            </label>
+                          );
+                        })}
+                      </div>
                     </div>
                   )}
 
-                  <div className="space-y-3 pt-2">
-                    {/* Option A: WhatsApp Web */}
+                  {publishStatus && (
+                    <div
+                      className={`p-3 rounded-xl text-xs font-medium border ${
+                        publishStatus.type === 'error'
+                          ? 'bg-rose-50 border-rose-200 text-rose-800'
+                          : publishStatus.type === 'success'
+                          ? 'bg-emerald-50 border-emerald-200 text-emerald-800'
+                          : 'bg-teal-50 border-teal-200 text-[#004d5a]'
+                      }`}
+                    >
+                      {publishStatus.message}
+                    </div>
+                  )}
+
+                  <div className="space-y-3 pt-1">
+                    {/* Option A: WA Web */}
                     <div className="p-4 rounded-2xl border border-slate-200 hover:border-emerald-400 transition-colors bg-slate-50/50 space-y-2">
                       <div className="flex items-center justify-between">
                         <span className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
                           <MessageCircle className="w-4 h-4 text-emerald-600" />
-                          <span>Opção A: WhatsApp Web Manual</span>
+                          <span>WA Web (Manual)</span>
                         </span>
                         <span className="text-[10px] text-slate-500">Pronto</span>
                       </div>
                       <p className="text-[11px] text-slate-500 leading-relaxed">
-                        Abre o WhatsApp com mensagem pré-preenchida segura (sem expor laudo nem dados clínicos).
+                        Abre o WhatsApp Web com mensagem pré-preenchida segura e registra no histórico.
                       </p>
                       <button
                         onClick={() => handleWhatsAppWeb(publishingExam)}
                         className="w-full bg-emerald-600 hover:bg-emerald-700 text-white py-2 px-3 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition-colors cursor-pointer"
                       >
                         <ExternalLink className="w-3.5 h-3.5" />
-                        <span>Abrir no WhatsApp Web</span>
+                        <span>Abrir no WA Web</span>
                       </button>
                     </div>
 
-                    {/* Option B: Meta Template via automated server integration */}
+                    {/* Option B: WA Oficial */}
                     <div className="p-4 rounded-2xl border border-slate-200 hover:border-teal-400 transition-colors bg-slate-50/50 space-y-2">
                       <div className="flex items-center justify-between">
                         <span className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
                           <Send className="w-4 h-4 text-[#004d5a]" />
-                          <span>Opção B: Template Oficial WhatsApp</span>
+                          <span>WA Oficial (Automático)</span>
                         </span>
-                        <span className="text-[10px] text-slate-500">Disparo Automático</span>
+                        <span className="text-[10px] text-slate-500">Template Oficial</span>
                       </div>
                       <p className="text-[11px] text-slate-500 leading-relaxed">
-                        Envia notificação corporativa pré-formatada diretamente ao telefone cadastrado do paciente.
+                        Envia notificação corporativa via template oficial diretamente ao telefone do paciente.
                       </p>
                       <button
                         onClick={() => handleWhatsAppMetaWebhook(publishingExam)}
                         className="w-full bg-[#004d5a] hover:bg-[#003842] text-white py-2 px-3 rounded-xl font-bold text-xs flex items-center justify-center gap-2 transition-colors cursor-pointer"
                       >
                         <Send className="w-3.5 h-3.5" />
-                        <span>Disparar Notificação Oficial</span>
+                        <span>Disparar WA Oficial</span>
                       </button>
                     </div>
                   </div>
@@ -1228,7 +1361,8 @@ export const SecretaryDashboard: React.FC<SecretaryDashboardProps> = ({
                   </div>
                 </div>
               </div>
-            )}
+              );
+            })()}
           </div>
         )}
 
@@ -1594,12 +1728,29 @@ export const SecretaryDashboard: React.FC<SecretaryDashboardProps> = ({
         {/* TAB 5: HISTÓRICO DE NOTIFICAÇÕES */}
         {activeTab === 'notificacoes' && (
           <div className="space-y-6 animate-in fade-in">
-            <div>
-              <h2 className="text-xl font-bold text-[#004d5a]">Histórico de Notificações</h2>
-              <p className="text-xs text-slate-500">
-                Acompanhe o registro de comunicações pelo WhatsApp Web e templates oficiais automatizados.
-              </p>
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+              <div>
+                <h2 className="text-xl font-bold text-[#004d5a]">Histórico de Notificações</h2>
+                <p className="text-xs text-slate-500">
+                  Acompanhe os envios realizados via WA Web e WA Oficial para os pacientes.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={loadData}
+                disabled={isLoading}
+                className="self-start sm:self-auto px-3.5 py-2 rounded-xl border border-slate-200 bg-white hover:bg-slate-50 text-xs font-semibold text-[#004d5a] flex items-center gap-1.5 cursor-pointer disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${isLoading ? 'animate-spin' : ''}`} />
+                <span>Atualizar</span>
+              </button>
             </div>
+
+            {notificationsError && (
+              <div className="p-3.5 rounded-xl bg-rose-50 border border-rose-200 text-xs text-rose-800 font-medium">
+                {notificationsError}
+              </div>
+            )}
 
             <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden shadow-xs">
               <div className="overflow-x-auto">
@@ -1630,26 +1781,36 @@ export const SecretaryDashboard: React.FC<SecretaryDashboardProps> = ({
                             {n.patient?.fullName || 'Paciente'}
                           </td>
                           <td className="py-3 px-4 text-slate-700">
-                            {n.exam?.title || 'Exame'}
+                            {n.examSummary || n.exam?.title || 'Exame'}
                           </td>
                           <td className="py-3 px-4 font-mono text-[11px] text-slate-600">
-                            {n.channel === 'whatsapp_web' ? 'WhatsApp Web' : 'Template Oficial (Meta)'}
+                            {n.channel === 'whatsapp_web'
+                              ? 'WA Web'
+                              : n.channel === 'email'
+                              ? 'E-mail'
+                              : 'WA Oficial'}
                           </td>
                           <td className="py-3 px-4">
                             <span
                               className={`px-2 py-0.5 rounded text-[10px] font-bold uppercase tracking-wider ${
                                 n.status === 'entregue' || n.status === 'lido'
                                   ? 'bg-emerald-50 text-emerald-700'
+                                  : n.status === 'falha'
+                                  ? 'bg-rose-50 text-rose-700'
+                                  : n.channel === 'whatsapp_web'
+                                  ? 'bg-emerald-50 text-emerald-700'
                                   : n.status === 'enviado'
                                   ? 'bg-blue-50 text-blue-700'
                                   : n.status === 'processando'
                                   ? 'bg-amber-50 text-amber-700'
-                                  : n.status === 'falha'
-                                  ? 'bg-rose-50 text-rose-700'
                                   : 'bg-slate-100 text-slate-700'
                               }`}
                             >
-                              {n.status === 'enviado'
+                              {n.status === 'falha'
+                                ? 'Falha'
+                                : n.channel === 'whatsapp_web'
+                                ? 'Aberto (WA Web)'
+                                : n.status === 'enviado'
                                 ? 'Aceito (Meta)'
                                 : n.status === 'entregue'
                                 ? 'Entregue'
@@ -1657,8 +1818,6 @@ export const SecretaryDashboard: React.FC<SecretaryDashboardProps> = ({
                                 ? 'Lido'
                                 : n.status === 'processando'
                                 ? 'Processando'
-                                : n.status === 'falha'
-                                ? 'Falha'
                                 : 'Pendente'}
                             </span>
                           </td>
