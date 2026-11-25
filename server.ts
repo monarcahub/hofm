@@ -720,6 +720,212 @@ app.get(
 );
 
 // 5. Secretary/Admin: Upload exam to private bucket `fm-exams`
+const ALLOWED_EXAM_MIME_TYPES = new Set([
+  'application/pdf',
+  'image/jpeg',
+  'image/png',
+  'image/webp',
+]);
+
+const EXAM_MIME_DEFAULT_EXT: Record<string, string> = {
+  'application/pdf': '.pdf',
+  'image/jpeg': '.jpg',
+  'image/png': '.png',
+  'image/webp': '.webp',
+};
+
+const ALLOWED_EXAM_EXTENSIONS = new Set(['.pdf', '.jpg', '.jpeg', '.png', '.webp']);
+const MAX_EXAM_FILE_SIZE_BYTES = 25 * 1024 * 1024; // 25 MB
+
+// 5a. Issue a short-lived signed upload URL so files up to 25MB upload directly to Supabase Storage (bypasses 4.5MB serverless body limits)
+app.post(
+  '/api/admin/exams/upload-url',
+  requireAuth,
+  requireRoles(['admin', 'secretary']),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { patientId, fileName, mimeType, fileSize } = req.body || {};
+      const cleanPatientId = typeof patientId === 'string' ? patientId.trim() : '';
+      const cleanMimeType = typeof mimeType === 'string' ? mimeType.trim().toLowerCase() : '';
+      const numericSize = Number(fileSize);
+
+      if (!cleanPatientId) {
+        res.status(400).json({ error: 'Identificador do paciente é obrigatório.' });
+        return;
+      }
+
+      if (!ALLOWED_EXAM_MIME_TYPES.has(cleanMimeType)) {
+        res.status(400).json({ error: 'Tipo de arquivo não permitido. Apenas PDF, JPEG, PNG e WebP são aceitos.' });
+        return;
+      }
+
+      if (!Number.isFinite(numericSize) || numericSize <= 0 || numericSize > MAX_EXAM_FILE_SIZE_BYTES) {
+        res.status(400).json({ error: 'O arquivo deve ter entre 1 byte e 25 MB.' });
+        return;
+      }
+
+      if (!supabaseAdmin) {
+        res.status(503).json({ error: 'Serviço de armazenamento não configurado no servidor.' });
+        return;
+      }
+
+      const { data: patient, error: patientCheckError } = await supabaseAdmin
+        .from('fm_patients')
+        .select('id, internal_id, full_name')
+        .eq('id', cleanPatientId)
+        .single();
+
+      if (patientCheckError || !patient) {
+        res.status(404).json({ error: 'Paciente não localizado.' });
+        return;
+      }
+
+      const rawExt = typeof fileName === 'string' ? path.extname(fileName).toLowerCase() : '';
+      const safeExt = ALLOWED_EXAM_EXTENSIONS.has(rawExt)
+        ? rawExt
+        : (EXAM_MIME_DEFAULT_EXT[cleanMimeType] || '.pdf');
+
+      const folderName = `patient-${patient.internal_id || patient.id}`;
+      const cleanSafeName = `${Date.now()}-${crypto.randomBytes(6).toString('hex')}${safeExt}`;
+      const storagePath = `${folderName}/${cleanSafeName}`;
+
+      const { data: signedData, error: signedError } = await supabaseAdmin.storage
+        .from('fm-exams')
+        .createSignedUploadUrl(storagePath);
+
+      if (signedError || !signedData?.token) {
+        res.status(400).json({ error: signedError?.message || 'Não foi possível gerar URL de envio seguro.' });
+        return;
+      }
+
+      res.json({
+        success: true,
+        path: signedData.path || storagePath,
+        token: signedData.token,
+        signedUrl: signedData.signedUrl,
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || 'Falha ao preparar upload seguro do exame.' });
+    }
+  }
+);
+
+// 5b. Confirm direct-to-storage upload and persist metadata in `fm_exams` + audit log
+app.post(
+  '/api/admin/exams/confirm-upload',
+  requireAuth,
+  requireRoles(['admin', 'secretary']),
+  async (req: AuthenticatedRequest, res: Response) => {
+    try {
+      const { patientId, title, examDate, storagePath, fileSize, mimeType } = req.body || {};
+      const cleanPatientId = typeof patientId === 'string' ? patientId.trim() : '';
+      const cleanTitle = typeof title === 'string' ? title.trim() : '';
+      const cleanExamDate = typeof examDate === 'string' ? examDate.trim() : '';
+      const cleanStoragePath = typeof storagePath === 'string' ? storagePath.trim() : '';
+      const cleanMimeType = typeof mimeType === 'string' ? mimeType.trim().toLowerCase() : '';
+      const numericSize = Number(fileSize);
+
+      if (!cleanPatientId || !cleanTitle || !cleanExamDate || !cleanStoragePath) {
+        res.status(400).json({ error: 'Dados obrigatórios do exame ausentes para confirmação.' });
+        return;
+      }
+
+      if (!ALLOWED_EXAM_MIME_TYPES.has(cleanMimeType)) {
+        res.status(400).json({ error: 'Tipo MIME inválido para o exame.' });
+        return;
+      }
+
+      if (!Number.isFinite(numericSize) || numericSize <= 0 || numericSize > MAX_EXAM_FILE_SIZE_BYTES) {
+        res.status(400).json({ error: 'Tamanho de arquivo inválido (máximo 25 MB).' });
+        return;
+      }
+
+      if (!supabaseAdmin) {
+        res.status(503).json({ error: 'Serviço de armazenamento não configurado no servidor.' });
+        return;
+      }
+
+      const { data: patient, error: patientCheckError } = await supabaseAdmin
+        .from('fm_patients')
+        .select('id, internal_id, full_name')
+        .eq('id', cleanPatientId)
+        .single();
+
+      if (patientCheckError || !patient) {
+        res.status(404).json({ error: 'Paciente não localizado.' });
+        return;
+      }
+
+      const expectedFolder = `patient-${patient.internal_id || patient.id}`;
+      const pathSegments = cleanStoragePath.split('/');
+      if (
+        cleanStoragePath.includes('..') ||
+        cleanStoragePath.includes('\\') ||
+        pathSegments.length !== 2 ||
+        pathSegments[0] !== expectedFolder ||
+        !pathSegments[1]
+      ) {
+        res.status(400).json({ error: 'Caminho de armazenamento inválido para o paciente informado.' });
+        return;
+      }
+
+      const fileNameSegment = pathSegments[1];
+      const { data: listedFiles, error: listError } = await supabaseAdmin.storage
+        .from('fm-exams')
+        .list(expectedFolder, { limit: 20, search: fileNameSegment });
+
+      if (listError || !(listedFiles || []).some((entry) => entry.name === fileNameSegment)) {
+        res.status(400).json({ error: 'O arquivo não foi encontrado no storage após o envio. Tente novamente.' });
+        return;
+      }
+
+      const { data: examRecord, error: examDbError } = await supabaseAdmin
+        .from('fm_exams')
+        .insert({
+          patient_id: patient.id,
+          title: cleanTitle,
+          exam_date: cleanExamDate,
+          file_path: cleanStoragePath,
+          file_size: numericSize,
+          mime_type: cleanMimeType,
+          is_published: false,
+          created_by: req.user!.id,
+          created_at: new Date().toISOString(),
+        })
+        .select()
+        .single();
+
+      if (examDbError) {
+        await supabaseAdmin.storage.from('fm-exams').remove([cleanStoragePath]).catch(() => {});
+        res.status(400).json({ error: `Erro ao registrar metadados do exame: ${examDbError.message}` });
+        return;
+      }
+
+      await supabaseAdmin.from('fm_audit_logs').insert({
+        user_id: req.user!.id,
+        action: 'EXAM_UPLOADED',
+        entity_type: 'fm_exams',
+        entity_id: examRecord.id,
+        details: {
+          patient_id: patient.id,
+          title: cleanTitle,
+          size: numericSize,
+          upload_mode: 'signed_direct',
+        },
+        ip_address: req.ip || '',
+        created_at: new Date().toISOString(),
+      });
+
+      res.status(201).json({
+        success: true,
+        exam: examRecord,
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: err.message || 'Falha ao confirmar upload do exame.' });
+    }
+  }
+);
+
 app.post(
   '/api/admin/exams/upload',
   requireAuth,

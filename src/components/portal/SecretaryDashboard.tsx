@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { useAuth } from '../../context/AuthContext';
-import { Patient, Exam, NotificationRecord } from '../../lib/supabase';
+import { Patient, Exam, NotificationRecord, supabase, isSupabaseConfigured } from '../../lib/supabase';
 import {
   Users, FileText, Upload, Send, Search, Plus, CheckCircle,
   Clock, AlertTriangle, Eye, Download, LogOut, Check, X,
@@ -382,23 +382,127 @@ export const SecretaryDashboard: React.FC<SecretaryDashboardProps> = ({
         ? `${baseTitle} (Parte ${i + 1}/${totalCount})`
         : baseTitle;
 
-      const formData = new FormData();
-      formData.append('patientId', uploadSelectedPatientId);
-      formData.append('title', resolvedTitle);
-      formData.append('examDate', uploadDate);
-      formData.append('file', item.file);
+      const resolveExamMimeType = (file: File): string => {
+        if (file.type && ['application/pdf', 'image/jpeg', 'image/png', 'image/webp'].includes(file.type.toLowerCase())) {
+          return file.type.toLowerCase();
+        }
+        const lowerName = file.name.toLowerCase();
+        if (lowerName.endsWith('.jpg') || lowerName.endsWith('.jpeg')) return 'image/jpeg';
+        if (lowerName.endsWith('.png')) return 'image/png';
+        if (lowerName.endsWith('.webp')) return 'image/webp';
+        return 'application/pdf';
+      };
+
+      const parseApiJsonSafe = async (res: Response): Promise<any> => {
+        const rawText = await res.text();
+        if (!rawText) return {};
+        try {
+          return JSON.parse(rawText);
+        } catch {
+          if (res.status === 413 || rawText.toLowerCase().includes('request entity too large')) {
+            return {
+              error:
+                'O servidor recusou o envio direto por exceder o limite de tamanho da requisição HTTP (413). Use o envio direto ao storage ou tente um arquivo menor.',
+            };
+          }
+          return {
+            error: `Resposta inesperada do servidor (HTTP ${res.status}): ${rawText.slice(0, 120)}`,
+          };
+        }
+      };
+
+      const resolvedMimeType = resolveExamMimeType(item.file);
 
       try {
-        const res = await fetch('/api/admin/exams/upload', {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${token}`,
-          },
-          body: formData,
-        });
+        let uploadSucceeded = false;
+        let errorMessage = 'Erro ao enviar arquivo.';
+        let shouldFallbackLegacy = !isSupabaseConfigured;
 
-        const data = await res.json();
-        if (res.ok && data.success) {
+        if (isSupabaseConfigured) {
+          // 1. Request short-lived signed upload URL (tiny JSON payload, bypasses 4.5MB serverless body limit)
+          const urlRes = await fetch('/api/admin/exams/upload-url', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({
+              patientId: uploadSelectedPatientId,
+              fileName: item.file.name,
+              mimeType: resolvedMimeType,
+              fileSize: item.file.size,
+            }),
+          });
+
+          const urlData = await parseApiJsonSafe(urlRes);
+
+          if (urlRes.status === 404 && item.file.size <= 4 * 1024 * 1024) {
+            shouldFallbackLegacy = true;
+          } else if (!urlRes.ok || !urlData.success || !urlData.path || !urlData.token) {
+            errorMessage = urlData.error || 'Não foi possível iniciar o envio seguro do exame.';
+          } else {
+            // 2. Upload file directly from browser to Supabase Storage `fm-exams` (supports up to 25 MB)
+            const { error: directStorageError } = await supabase.storage
+              .from('fm-exams')
+              .uploadToSignedUrl(urlData.path, urlData.token, item.file, {
+                contentType: resolvedMimeType,
+                upsert: false,
+              });
+
+            if (directStorageError) {
+              errorMessage = `Erro no upload para o storage: ${directStorageError.message}`;
+            } else {
+              // 3. Confirm upload and save exam metadata + audit log on backend
+              const confirmRes = await fetch('/api/admin/exams/confirm-upload', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  Authorization: `Bearer ${token}`,
+                },
+                body: JSON.stringify({
+                  patientId: uploadSelectedPatientId,
+                  title: resolvedTitle,
+                  examDate: uploadDate,
+                  storagePath: urlData.path,
+                  fileSize: item.file.size,
+                  mimeType: resolvedMimeType,
+                }),
+              });
+
+              const confirmData = await parseApiJsonSafe(confirmRes);
+              if (confirmRes.ok && confirmData.success) {
+                uploadSucceeded = true;
+              } else {
+                errorMessage = confirmData.error || 'Arquivo enviado, mas falhou ao registrar no histórico.';
+              }
+            }
+          }
+        }
+
+        if (!uploadSucceeded && shouldFallbackLegacy) {
+          const formData = new FormData();
+          formData.append('patientId', uploadSelectedPatientId);
+          formData.append('title', resolvedTitle);
+          formData.append('examDate', uploadDate);
+          formData.append('file', item.file);
+
+          const res = await fetch('/api/admin/exams/upload', {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${token}`,
+            },
+            body: formData,
+          });
+
+          const data = await parseApiJsonSafe(res);
+          if (res.ok && data.success) {
+            uploadSucceeded = true;
+          } else {
+            errorMessage = data.error || 'Erro ao enviar arquivo.';
+          }
+        }
+
+        if (uploadSucceeded) {
           successCount++;
           handleUpdateUploadItem(item.id, { status: 'success' });
         } else {
@@ -406,7 +510,7 @@ export const SecretaryDashboard: React.FC<SecretaryDashboardProps> = ({
           failedIds.add(item.id);
           handleUpdateUploadItem(item.id, {
             status: 'error',
-            errorMessage: data.error || 'Erro ao enviar arquivo.',
+            errorMessage,
           });
         }
       } catch (err: any) {
