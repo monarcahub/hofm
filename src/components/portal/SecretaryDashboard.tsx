@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { useAuth } from '../../context/AuthContext';
 import { Patient, Exam, NotificationRecord } from '../../lib/supabase';
 import {
@@ -7,6 +7,14 @@ import {
   MessageCircle, ExternalLink, ShieldCheck, KeyRound, RefreshCw,
   FolderOpen, Calendar, Phone, Mail, UserPlus, Copy
 } from 'lucide-react';
+
+interface UploadExamItem {
+  id: string;
+  file: File | null;
+  title: string;
+  status: 'pending' | 'uploading' | 'success' | 'error';
+  errorMessage?: string;
+}
 
 interface SecretaryDashboardProps {
   onLogout: () => void;
@@ -53,9 +61,12 @@ export const SecretaryDashboard: React.FC<SecretaryDashboardProps> = ({
   const [uploadSelectedPatientId, setUploadSelectedPatientId] = useState('');
   const [uploadTitle, setUploadTitle] = useState('');
   const [uploadDate, setUploadDate] = useState(new Date().toISOString().split('T')[0]);
-  const [uploadFile, setUploadFile] = useState<File | null>(null);
+  const [uploadMultipleExams, setUploadMultipleExams] = useState(false);
+  const [uploadItems, setUploadItems] = useState<UploadExamItem[]>([]);
   const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<{ current: number; total: number } | null>(null);
   const [uploadFeedback, setUploadFeedback] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+  const multiFileInputRef = useRef<HTMLInputElement | null>(null);
 
   // Publish / Notify Modal
   const [publishingExam, setPublishingExam] = useState<Exam | null>(null);
@@ -166,57 +177,272 @@ export const SecretaryDashboard: React.FC<SecretaryDashboardProps> = ({
     }
   };
 
+  const createUploadItemId = () => `${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
+
+  const formatTitleFromFilename = (fileName: string) =>
+    fileName
+      .replace(/\.[^/.]+$/, '')
+      .replace(/[_-]+/g, ' ')
+      .trim();
+
+  const validateExamFile = (file: File): string | null => {
+    const allowedMimes = ['application/pdf', 'image/jpeg', 'image/png', 'image/webp'];
+    const isPdfExt = file.name.toLowerCase().endsWith('.pdf');
+    if (!allowedMimes.includes(file.type) && !isPdfExt) {
+      return `O arquivo "${file.name}" não tem formato permitido (use PDF, JPEG, PNG ou WebP).`;
+    }
+    if (file.size > 25 * 1024 * 1024) {
+      return `O arquivo "${file.name}" excede o limite máximo permitido de 25 MB.`;
+    }
+    return null;
+  };
+
+  const handleFilesSelected = (fileList: FileList | null) => {
+    if (!fileList || fileList.length === 0) return;
+    const incomingFiles = Array.from(fileList);
+
+    for (const f of incomingFiles) {
+      const validationErr = validateExamFile(f);
+      if (validationErr) {
+        setUploadFeedback({ type: 'error', message: validationErr });
+        if (multiFileInputRef.current) multiFileInputRef.current.value = '';
+        return;
+      }
+    }
+
+    setUploadFeedback(null);
+    setUploadItems((prev) => {
+      const next = [...prev];
+      for (const file of incomingFiles) {
+        const alreadyAdded = next.some(
+          (item) =>
+            item.file &&
+            item.file.name === file.name &&
+            item.file.size === file.size &&
+            item.file.lastModified === file.lastModified
+        );
+        if (!alreadyAdded) {
+          // Fill an empty manual row first if one exists in multi-exam mode
+          const emptyIdx = next.findIndex((item) => !item.file);
+          if (uploadMultipleExams && emptyIdx !== -1) {
+            next[emptyIdx] = {
+              ...next[emptyIdx],
+              file,
+              title: next[emptyIdx].title.trim() || formatTitleFromFilename(file.name),
+              status: 'pending',
+              errorMessage: undefined,
+            };
+          } else {
+            next.push({
+              id: createUploadItemId(),
+              file,
+              title: uploadMultipleExams ? formatTitleFromFilename(file.name) : '',
+              status: 'pending',
+            });
+          }
+        }
+      }
+      return next;
+    });
+
+    if (multiFileInputRef.current) {
+      multiFileInputRef.current.value = '';
+    }
+  };
+
+  const handleToggleMultipleExams = (checked: boolean) => {
+    setUploadMultipleExams(checked);
+    setUploadFeedback(null);
+
+    if (checked) {
+      setUploadItems((prev) => {
+        if (prev.length === 0) {
+          return [
+            {
+              id: createUploadItemId(),
+              file: null,
+              title: uploadTitle.trim(),
+              status: 'pending',
+            },
+          ];
+        }
+        return prev.map((item) => ({
+          ...item,
+          title:
+            item.title.trim() ||
+            uploadTitle.trim() ||
+            (item.file ? formatTitleFromFilename(item.file.name) : ''),
+        }));
+      });
+    } else {
+      setUploadItems((prev) => {
+        const withFiles = prev.filter((item) => item.file !== null);
+        if (!uploadTitle.trim() && prev[0]?.title?.trim()) {
+          setUploadTitle(prev[0].title.trim());
+        }
+        return withFiles;
+      });
+    }
+  };
+
+  const handleAddManualExamRow = () => {
+    setUploadItems((prev) => [
+      ...prev,
+      {
+        id: createUploadItemId(),
+        file: null,
+        title: '',
+        status: 'pending',
+      },
+    ]);
+  };
+
+  const handleUpdateUploadItem = (id: string, patch: Partial<UploadExamItem>) => {
+    setUploadItems((prev) =>
+      prev.map((item) => (item.id === id ? { ...item, ...patch } : item))
+    );
+  };
+
+  const handleRemoveUploadItem = (id: string) => {
+    setUploadItems((prev) => prev.filter((item) => item.id !== id));
+  };
+
   // Handle Exam Upload to private bucket `fm-exams`
   const handleUploadExam = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!uploadFile) {
-      setUploadFeedback({ type: 'error', message: 'Selecione um arquivo de exame (PDF, PNG, JPEG ou WebP).' });
+    if (!uploadSelectedPatientId) {
+      setUploadFeedback({ type: 'error', message: 'Selecione um paciente.' });
       return;
     }
 
-    if (uploadFile.size > 25 * 1024 * 1024) {
-      setUploadFeedback({ type: 'error', message: 'O arquivo excede o limite máximo permitido de 25 MB.' });
+    if (!uploadMultipleExams && !uploadTitle.trim()) {
+      setUploadFeedback({ type: 'error', message: 'Informe o título do exame.' });
       return;
+    }
+
+    if (uploadItems.length === 0) {
+      setUploadFeedback({
+        type: 'error',
+        message: 'Anexe ao menos um arquivo de exame (PDF, PNG, JPEG ou WebP).',
+      });
+      return;
+    }
+
+    for (let i = 0; i < uploadItems.length; i++) {
+      const item = uploadItems[i];
+      if (uploadMultipleExams && !item.title.trim()) {
+        setUploadFeedback({
+          type: 'error',
+          message: `Informe o título do Exame #${i + 1}.`,
+        });
+        return;
+      }
+      if (!item.file) {
+        setUploadFeedback({
+          type: 'error',
+          message: uploadMultipleExams
+            ? `Anexe o arquivo do Exame #${i + 1} ("${item.title.trim() || 'Sem título'}").`
+            : 'Selecione um arquivo válido.',
+        });
+        return;
+      }
+      const validationErr = validateExamFile(item.file);
+      if (validationErr) {
+        setUploadFeedback({ type: 'error', message: validationErr });
+        return;
+      }
     }
 
     setUploading(true);
     setUploadFeedback(null);
 
     const token = session?.access_token || '';
-    const formData = new FormData();
-    formData.append('patientId', uploadSelectedPatientId);
-    formData.append('title', uploadTitle);
-    formData.append('examDate', uploadDate);
-    formData.append('file', uploadFile);
+    const totalCount = uploadItems.length;
+    const baseTitle = uploadTitle.trim();
+    let successCount = 0;
+    let failCount = 0;
+    const failedIds = new Set<string>();
 
-    try {
-      const res = await fetch('/api/admin/exams/upload', {
-        method: 'POST',
-        headers: {
-          Authorization: `Bearer ${token}`,
-        },
-        body: formData,
-      });
+    for (let i = 0; i < uploadItems.length; i++) {
+      const item = uploadItems[i];
+      if (!item.file) continue;
 
-      const data = await res.json();
-      if (res.ok && data.success) {
-        setUploadFeedback({
-          type: 'success',
-          message: `Exame "${uploadTitle}" salvo com sucesso em ambiente protegido! Pronto para publicação.`,
+      setUploadProgress({ current: i + 1, total: totalCount });
+      handleUpdateUploadItem(item.id, { status: 'uploading', errorMessage: undefined });
+
+      const resolvedTitle = uploadMultipleExams
+        ? item.title.trim()
+        : totalCount > 1
+        ? `${baseTitle} (Parte ${i + 1}/${totalCount})`
+        : baseTitle;
+
+      const formData = new FormData();
+      formData.append('patientId', uploadSelectedPatientId);
+      formData.append('title', resolvedTitle);
+      formData.append('examDate', uploadDate);
+      formData.append('file', item.file);
+
+      try {
+        const res = await fetch('/api/admin/exams/upload', {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${token}`,
+          },
+          body: formData,
         });
-        setUploadTitle('');
-        setUploadFile(null);
-        loadData();
-      } else {
-        setUploadFeedback({
-          type: 'error',
-          message: data.error || 'Erro ao realizar upload do exame.',
+
+        const data = await res.json();
+        if (res.ok && data.success) {
+          successCount++;
+          handleUpdateUploadItem(item.id, { status: 'success' });
+        } else {
+          failCount++;
+          failedIds.add(item.id);
+          handleUpdateUploadItem(item.id, {
+            status: 'error',
+            errorMessage: data.error || 'Erro ao enviar arquivo.',
+          });
+        }
+      } catch (err: any) {
+        failCount++;
+        failedIds.add(item.id);
+        handleUpdateUploadItem(item.id, {
+          status: 'error',
+          errorMessage: err.message || 'Falha de comunicação com o servidor.',
         });
       }
-    } catch (err: any) {
-      setUploadFeedback({ type: 'error', message: err.message || 'Falha de comunicação com o servidor.' });
-    } finally {
-      setUploading(false);
+    }
+
+    setUploadProgress(null);
+    setUploading(false);
+
+    if (successCount > 0) {
+      loadData();
+    }
+
+    if (failCount === 0) {
+      setUploadFeedback({
+        type: 'success',
+        message:
+          successCount === 1
+            ? `Exame "${uploadMultipleExams ? uploadItems[0]?.title.trim() : baseTitle}" salvo com sucesso em ambiente protegido! Pronto para publicação.`
+            : `${successCount} ${uploadMultipleExams ? 'exames salvos' : 'arquivos do exame salvos'} com sucesso em ambiente protegido! Prontos para publicação.`,
+      });
+      setUploadTitle('');
+      setUploadItems([]);
+      if (multiFileInputRef.current) {
+        multiFileInputRef.current.value = '';
+      }
+    } else {
+      // Keep only items that failed so the receptionist can retry without duplicating already-saved exams
+      setUploadItems((prev) => prev.filter((item) => failedIds.has(item.id)));
+      setUploadFeedback({
+        type: 'error',
+        message:
+          successCount > 0
+            ? `${successCount} arquivo(s) salvo(s), mas ${failCount} falhou(aram). Corrija ou clique em Salvar novamente para reenviar os pendentes.`
+            : `Não foi possível enviar ${failCount} arquivo(s). Verifique os detalhes abaixo e tente novamente.`,
+      });
     }
   };
 
@@ -1011,9 +1237,9 @@ export const SecretaryDashboard: React.FC<SecretaryDashboardProps> = ({
           <div className="max-w-2xl mx-auto bg-white p-6 sm:p-8 rounded-3xl border border-slate-200 shadow-xs space-y-6 animate-in fade-in">
             <div className="space-y-1">
               <span className="text-xs font-bold uppercase text-[#be7b52]">UPLOAD SEGURO</span>
-              <h2 className="text-xl font-bold text-[#004d5a]">Enviar Exame de Paciente</h2>
+              <h2 className="text-xl font-bold text-[#004d5a]">Enviar Exame(s) de Paciente</h2>
               <p className="text-xs text-slate-500">
-                Armazenamento privado e criptografado. Aceita PDF, JPEG, PNG e WebP até 25 MB.
+                Armazenamento privado e criptografado. Aceita PDF, JPEG, PNG e WebP até 25 MB por arquivo.
               </p>
             </div>
 
@@ -1056,21 +1282,7 @@ export const SecretaryDashboard: React.FC<SecretaryDashboardProps> = ({
 
               <div>
                 <label className="block text-xs font-semibold text-slate-700 mb-1">
-                  2. Título do Exame *
-                </label>
-                <input
-                  type="text"
-                  required
-                  placeholder="Ex: Topografia Corneana / Biometria / Mapeamento de Retina"
-                  value={uploadTitle}
-                  onChange={(e) => setUploadTitle(e.target.value)}
-                  className="w-full px-3.5 py-2.5 text-xs rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-[#004d5a]"
-                />
-              </div>
-
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">
-                  3. Data de Realização do Exame *
+                  2. Data de Realização do(s) Exame(s) *
                 </label>
                 <input
                   type="date"
@@ -1081,34 +1293,298 @@ export const SecretaryDashboard: React.FC<SecretaryDashboardProps> = ({
                 />
               </div>
 
-              <div>
-                <label className="block text-xs font-semibold text-slate-700 mb-1">
-                  4. Arquivo do Laudo / Imagem (PDF, JPEG, PNG, WebP até 25MB) *
+              {/* Checkbox to switch between multiple files for ONE exam vs multiple DISTINCT exams */}
+              <div className="p-3.5 rounded-2xl bg-slate-50 border border-slate-200/80">
+                <label className="flex items-start gap-3 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={uploadMultipleExams}
+                    onChange={(e) => handleToggleMultipleExams(e.target.checked)}
+                    disabled={uploading}
+                    className="mt-0.5 h-4 w-4 rounded border-slate-300 text-[#004d5a] focus:ring-[#004d5a] cursor-pointer"
+                  />
+                  <div>
+                    <span className="block text-xs font-bold text-[#004d5a]">
+                      Estou enviando mais de um exame diferente (nomear cada exame)
+                    </span>
+                    <span className="block text-[11px] text-slate-500 mt-0.5 leading-relaxed">
+                      Deixe desmarcado se for apenas 1 exame com um ou mais arquivos (ex: 2 PDFs do mesmo exame). Marque se quiser criar um título diferente para cada exame anexado.
+                    </span>
+                  </div>
                 </label>
-                <input
-                  type="file"
-                  required
-                  accept=".pdf,image/jpeg,image/png,image/webp"
-                  onChange={(e) => setUploadFile(e.target.files?.[0] || null)}
-                  className="w-full text-xs text-slate-600 file:mr-4 file:py-2.5 file:px-4 file:rounded-xl file:border-0 file:text-xs file:font-semibold file:bg-teal-50 file:text-[#004d5a] hover:file:bg-teal-100 cursor-pointer border border-slate-200 rounded-xl p-1"
-                />
               </div>
+
+              {!uploadMultipleExams ? (
+                <>
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-700 mb-1">
+                      3. Título do Exame *
+                    </label>
+                    <input
+                      type="text"
+                      required
+                      placeholder="Ex: Topografia Corneana / Biometria / Mapeamento de Retina"
+                      value={uploadTitle}
+                      onChange={(e) => setUploadTitle(e.target.value)}
+                      className="w-full px-3.5 py-2.5 text-xs rounded-xl border border-slate-200 focus:outline-none focus:ring-2 focus:ring-[#004d5a]"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-xs font-semibold text-slate-700 mb-1">
+                      4. Arquivo(s) do Laudo / Imagem (pode selecionar vários PDFs ou imagens) *
+                    </label>
+                    <input
+                      ref={multiFileInputRef}
+                      type="file"
+                      multiple
+                      accept=".pdf,image/jpeg,image/png,image/webp"
+                      onChange={(e) => handleFilesSelected(e.target.files)}
+                      disabled={uploading}
+                      className="w-full text-xs text-slate-600 file:mr-4 file:py-2.5 file:px-4 file:rounded-xl file:border-0 file:text-xs file:font-semibold file:bg-teal-50 file:text-[#004d5a] hover:file:bg-teal-100 cursor-pointer border border-slate-200 rounded-xl p-1"
+                    />
+                    <p className="text-[11px] text-slate-400 mt-1">
+                      Você pode selecionar vários arquivos de uma vez ou clicar novamente para adicionar mais arquivos deste mesmo exame.
+                    </p>
+                  </div>
+
+                  {uploadItems.length > 0 && (
+                    <div className="space-y-2 pt-1">
+                      <div className="flex items-center justify-between text-[11px] font-semibold text-slate-600">
+                        <span>Arquivos selecionados ({uploadItems.length})</span>
+                        {!uploading && (
+                          <button
+                            type="button"
+                            onClick={() => setUploadItems([])}
+                            className="text-rose-600 hover:underline cursor-pointer"
+                          >
+                            Limpar todos
+                          </button>
+                        )}
+                      </div>
+                      <div className="space-y-2 max-h-56 overflow-y-auto pr-1">
+                        {uploadItems.map((item, idx) => (
+                          <div
+                            key={item.id}
+                            className="flex items-center justify-between gap-3 p-3 rounded-xl border border-slate-200 bg-slate-50/70 text-xs"
+                          >
+                            <div className="flex items-center gap-2.5 min-w-0">
+                              <FileText className="w-4 h-4 text-[#004d5a] shrink-0" />
+                              <div className="min-w-0">
+                                <p className="font-semibold text-slate-800 truncate">
+                                  {item.file?.name}
+                                </p>
+                                <p className="text-[11px] text-slate-500">
+                                  {item.file ? `${(item.file.size / 1024 / 1024).toFixed(2)} MB` : ''}
+                                  {uploadItems.length > 1 && ` • Será salvo como Parte ${idx + 1}/${uploadItems.length}`}
+                                </p>
+                                {item.errorMessage && (
+                                  <p className="text-[11px] text-rose-600 font-medium mt-0.5">
+                                    {item.errorMessage}
+                                  </p>
+                                )}
+                              </div>
+                            </div>
+                            <div className="flex items-center gap-2 shrink-0">
+                              {item.status === 'uploading' && (
+                                <span className="text-[11px] font-semibold text-[#004d5a]">Enviando...</span>
+                              )}
+                              {item.status === 'success' && (
+                                <CheckCircle className="w-4 h-4 text-emerald-600" />
+                              )}
+                              {item.status === 'error' && (
+                                <AlertTriangle className="w-4 h-4 text-rose-600" />
+                              )}
+                              {!uploading && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleRemoveUploadItem(item.id)}
+                                  className="p-1 text-slate-400 hover:text-rose-600 cursor-pointer"
+                                  title="Remover arquivo"
+                                >
+                                  <X className="w-4 h-4" />
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </>
+              ) : (
+                <div className="space-y-3">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                    <label className="block text-xs font-semibold text-slate-700">
+                      3. Nomeie e anexe cada exame ({uploadItems.length}) *
+                    </label>
+                    <div className="flex items-center gap-2">
+                      <label className="bg-teal-50 hover:bg-teal-100 text-[#004d5a] px-3 py-1.5 rounded-lg text-[11px] font-bold flex items-center gap-1.5 cursor-pointer transition-colors">
+                        <Upload className="w-3.5 h-3.5" />
+                        <span>Selecionar vários arquivos</span>
+                        <input
+                          ref={multiFileInputRef}
+                          type="file"
+                          multiple
+                          accept=".pdf,image/jpeg,image/png,image/webp"
+                          onChange={(e) => handleFilesSelected(e.target.files)}
+                          disabled={uploading}
+                          className="hidden"
+                        />
+                      </label>
+                      <button
+                        type="button"
+                        onClick={handleAddManualExamRow}
+                        disabled={uploading}
+                        className="bg-slate-100 hover:bg-slate-200 text-slate-700 px-3 py-1.5 rounded-lg text-[11px] font-bold flex items-center gap-1 cursor-pointer transition-colors disabled:opacity-50"
+                      >
+                        <Plus className="w-3.5 h-3.5" />
+                        <span>Adicionar exame</span>
+                      </button>
+                    </div>
+                  </div>
+
+                  {uploadItems.length === 0 ? (
+                    <div className="p-6 rounded-2xl border border-dashed border-slate-300 bg-slate-50/50 text-center space-y-2">
+                      <p className="text-xs text-slate-500">
+                        Clique em <strong>Selecionar vários arquivos</strong> para criar um item por arquivo automaticamente, ou em <strong>Adicionar exame</strong> para digitar o nome e anexar um por um.
+                      </p>
+                    </div>
+                  ) : (
+                    <div className="space-y-3">
+                      {uploadItems.map((item, idx) => (
+                        <div
+                          key={item.id}
+                          className={`p-4 rounded-2xl border space-y-3 transition-colors ${
+                            item.status === 'error'
+                              ? 'border-rose-300 bg-rose-50/40'
+                              : item.status === 'success'
+                              ? 'border-emerald-300 bg-emerald-50/40'
+                              : 'border-slate-200 bg-slate-50/50'
+                          }`}
+                        >
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-[11px] font-bold uppercase tracking-wider text-[#be7b52]">
+                              Exame #{idx + 1}
+                            </span>
+                            <div className="flex items-center gap-2">
+                              {item.status === 'uploading' && (
+                                <span className="text-[11px] font-semibold text-[#004d5a]">
+                                  Enviando...
+                                </span>
+                              )}
+                              {item.status === 'success' && (
+                                <span className="text-[11px] font-semibold text-emerald-700 flex items-center gap-1">
+                                  <CheckCircle className="w-3.5 h-3.5" /> Salvo
+                                </span>
+                              )}
+                              {!uploading && (
+                                <button
+                                  type="button"
+                                  onClick={() => handleRemoveUploadItem(item.id)}
+                                  className="text-slate-400 hover:text-rose-600 p-1 cursor-pointer"
+                                  title="Remover este exame"
+                                >
+                                  <X className="w-4 h-4" />
+                                </button>
+                              )}
+                            </div>
+                          </div>
+
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                            <div>
+                              <label className="block text-[11px] font-semibold text-slate-600 mb-1">
+                                Título do Exame *
+                              </label>
+                              <input
+                                type="text"
+                                required
+                                disabled={uploading}
+                                placeholder="Ex: Topografia Corneana"
+                                value={item.title}
+                                onChange={(e) =>
+                                  handleUpdateUploadItem(item.id, { title: e.target.value })
+                                }
+                                className="w-full px-3 py-2 text-xs rounded-xl border border-slate-200 bg-white focus:outline-none focus:ring-2 focus:ring-[#004d5a]"
+                              />
+                            </div>
+
+                            <div>
+                              <label className="block text-[11px] font-semibold text-slate-600 mb-1">
+                                Arquivo (PDF, JPEG, PNG, WebP) *
+                              </label>
+                              <label className="flex items-center justify-between gap-2 px-3 py-2 text-xs rounded-xl border border-slate-200 bg-white hover:border-[#004d5a] cursor-pointer">
+                                <span className="truncate text-slate-700 font-medium">
+                                  {item.file
+                                    ? `${item.file.name} (${(item.file.size / 1024 / 1024).toFixed(2)} MB)`
+                                    : 'Anexar arquivo...'}
+                                </span>
+                                <span className="shrink-0 text-[11px] font-bold text-[#004d5a]">
+                                  {item.file ? 'Trocar' : 'Escolher'}
+                                </span>
+                                <input
+                                  type="file"
+                                  disabled={uploading}
+                                  accept=".pdf,image/jpeg,image/png,image/webp"
+                                  onChange={(e) => {
+                                    const picked = e.target.files?.[0];
+                                    e.target.value = '';
+                                    if (!picked) return;
+                                    const err = validateExamFile(picked);
+                                    if (err) {
+                                      setUploadFeedback({ type: 'error', message: err });
+                                      return;
+                                    }
+                                    setUploadFeedback(null);
+                                    handleUpdateUploadItem(item.id, {
+                                      file: picked,
+                                      title: item.title.trim() || formatTitleFromFilename(picked.name),
+                                      status: 'pending',
+                                      errorMessage: undefined,
+                                    });
+                                  }}
+                                  className="hidden"
+                                />
+                              </label>
+                            </div>
+                          </div>
+
+                          {item.errorMessage && (
+                            <p className="text-[11px] text-rose-600 font-medium">
+                              {item.errorMessage}
+                            </p>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
 
               <div className="pt-4 border-t border-slate-100 flex items-center justify-end gap-3">
                 <button
                   type="button"
+                  disabled={uploading}
                   onClick={() => setActiveTab('exames')}
-                  className="px-4 py-2 text-xs font-semibold text-slate-500"
+                  className="px-4 py-2 text-xs font-semibold text-slate-500 disabled:opacity-50"
                 >
                   Cancelar
                 </button>
                 <button
                   type="submit"
-                  disabled={uploading || !uploadSelectedPatientId}
+                  disabled={uploading || !uploadSelectedPatientId || uploadItems.length === 0}
                   className="bg-[#004d5a] hover:bg-[#003842] text-white px-6 py-2.5 rounded-xl font-bold text-xs flex items-center gap-2 shadow-xs disabled:opacity-50 cursor-pointer"
                 >
                   <Upload className="w-4 h-4" />
-                  <span>{uploading ? 'Enviando...' : 'Salvar'}</span>
+                  <span>
+                    {uploading
+                      ? uploadProgress
+                        ? `Enviando ${uploadProgress.current} de ${uploadProgress.total}...`
+                        : 'Enviando...'
+                      : uploadItems.length > 1
+                      ? `Salvar (${uploadItems.length})`
+                      : 'Salvar'}
+                  </span>
                 </button>
               </div>
             </form>
